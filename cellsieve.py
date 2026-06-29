@@ -1,27 +1,28 @@
 #!/usr/bin/env python3
 """
-Cell Sieve: A Unified Elastic Net MILP Gene-Panel Selector.
+Cell Sieve
 
 Description:
+Combinatorially compressed gene panels to distinguish cell types in scRNAseq data.
 This script selects optimal gene panels for cell type classification from scRNA-seq data 
 using an Elastic Net global prior combined with a Mixed Integer Linear Programming (MILP) solver.
 
 Example Commands:
 
 1. Default Run (runs a single panel size of 10):
-   python3 cell_sieve_v4.py --adata-path /path/to/data.h5ad --out-dir ./output --n-workers 8
+   cellsieve --adata-path /path/to/data.h5ad --out-dir ./output --n-workers 8
 
 2. Custom Single Panel Size:
-   python3 cell_sieve_v4.py --adata-path /path/to/data.h5ad --out-dir ./output --panel-size 40
+   cellsieve --adata-path /path/to/data.h5ad --out-dir ./output --panel-size 40
 
 3. Custom Titration (runs multiple specific sizes sequentially, e.g., 5, 15, and 30):
-   python3 cell_sieve_v4.py --adata-path /path/to/data.h5ad --out-dir ./output --titrate-panels 5 15 30
+   cellsieve --adata-path /path/to/data.h5ad --out-dir ./output --titrate-panels 5 15 30
 
 4. Misannotation Detection & Correction (flags and cleans bad annotations):
-   python3 cell_sieve_v4.py --adata-path /path/to/data.h5ad --out-dir ./output --correct-misannotations --panel-size 20
+   cellsieve --adata-path /path/to/data.h5ad --out-dir ./output --correct-misannotations --panel-size 20
 
 5. Find Redundant Gene Swaps (finds correlated substitutes for selected genes):
-   python3 cell_sieve_v4.py --adata-path /path/to/data.h5ad --out-dir ./output --find-redundant-swaps --corr-threshold 0.80
+   cellsieve --adata-path /path/to/data.h5ad --out-dir ./output --find-redundant-swaps --corr-threshold 0.80
 """
 
 import argparse
@@ -54,14 +55,10 @@ def parse_args():
     parser.add_argument("--out-dir", default="./elastic_sieve_output", help="Directory to save outputs.")
     parser.add_argument("--random-seed", type=int, default=42)
 
-    # Data Input Options
-    parser.add_argument("--use-raw", action="store_true", help="Use adata.raw as the starting matrix.")
-    parser.add_argument("--layer", type=str, default="raw_counts", help="Use a specific layer (e.g., 'counts') as the starting matrix.")
-    
     # Mode Toggles & Alpha
     parser.add_argument("--alpha", type=float, default=0.7, help="Specify the Elastic Net alpha (L1 Ratio) from 0.0 to 1.0. Default 0.7")
     parser.add_argument("--titrate-panels", nargs="+", type=int, default=None, help="Run multiple panel sizes sequentially. Usage: --titrate-panels 5 10 20 40")
-    parser.add_argument("--panel-size", type=int, default=10, help="Target panel size if not titrating. Default is 10.")
+    parser.add_argument("--panel-size", type=int, default=20, help="Target panel size if not titrating. Default is 10.")
     parser.add_argument("--max-cells", type=int, default=15000, help="Max cells to use for the Global Prior fitting.")
     parser.add_argument("--correct-misannotations", action="store_true", help="Flag cells with confidently incorrect labels, save a CSV report, and output a cleaned h5ad file.")
     parser.add_argument("--min-correction-margin", type=float, default=0.30, help="Minimum probability margin to override an existing annotation. Default is 0.30.")
@@ -71,6 +68,7 @@ def parse_args():
     parser.add_argument("--corr-threshold", type=float, default=0.75, help="Minimum Pearson R to consider a valid swap. Default is 0.75.")
 
     # MILP Solver Parameters
+    parser.add_argument("--gurobi-license-file", default=None, help="Optional path to gurobi.lic. Sets GRB_LICENSE_FILE for this run.")
     parser.add_argument("--mip-gap", type=float, default=0.10)
     parser.add_argument("--time-limit", type=float, default=300)
     parser.add_argument("--n-workers", type=int, default=24)
@@ -117,7 +115,7 @@ def compute_global_elasticnet(adata, y, args):
     pos_indices = all_indices[global_nonzero_mask]
     pos_scores = np.max(np.abs(W[:, global_nonzero_mask]), axis=0)
         
-    return pos_indices, pos_scores, args.alpha
+    return pos_indices, pos_scores
 
 
 def localized_subset_refit(adata, y, candidate_pool_idx, candidate_scores, args, panel_size_val):
@@ -209,7 +207,7 @@ def build_milp_matrix(adata, candidate_idx, scaler, model, pair_df):
     return A, bias
 
 
-def solve_milp(A, bias, weights, args, panel_size, candidate_priors, optimal_alpha):
+def solve_milp(A, bias, weights, args, panel_size, candidate_priors):
     n_constraints, n_genes = A.shape
 
     model = gp.Model("unified_gene_panel_milp")
@@ -242,7 +240,9 @@ def solve_milp(A, bias, weights, args, panel_size, candidate_priors, optimal_alp
     margin_focus = 1.0
     prior_focus = 1.0  # You may need to tune this depending on the raw magnitude of your coefficients
 
-    model.setObjective(margin_focus * weighted_slack - prior_focus * prior_reward)
+    obj_expr = margin_focus * weighted_slack - prior_focus * prior_reward
+    
+    model.setObjective(obj_expr)
     model.ModelSense = GRB.MINIMIZE
 
     model.optimize()
@@ -449,32 +449,15 @@ def generate_outputs(out_dir, size_str, adata, y_full, selected_idx, unique_type
 
 def main():
     args = parse_args()
+
+    if args.gurobi_license_file:
+        os.environ["GRB_LICENSE_FILE"] = str(Path(args.gurobi_license_file).expanduser())
     
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     
     log(f"Reading Dataset: {args.adata_path}")
     adata = sc.read_h5ad(args.adata_path)
-
-    # 1. Select the correct starting matrix
-    if args.use_raw and args.layer:
-        raise ValueError("Cannot specify both --use-raw and --layer. Pick one.")
-
-    if args.use_raw:
-        if adata.raw is None:
-            raise ValueError("Requested --use-raw, but adata.raw is missing.")
-        log("Promoting adata.raw to adata.X...")
-        adata = adata.raw.to_adata()
-        
-    elif args.layer:
-        if args.layer not in adata.layers:
-            raise KeyError(f"Requested layer '{args.layer}' not found in adata.layers.")
-        log(f"Promoting adata.layers['{args.layer}'] to adata.X...")
-        adata.X = adata.layers[args.layer].copy()
-
-    # 2. Standardize baseline and preprocess
-    sc.pp.normalize_total(adata, target_sum=1e4)
-    sc.pp.log1p(adata)
 
     celltype_series = pd.Series(adata.obs[args.celltype_column].astype(str).values)
     unique_types = sorted(celltype_series.unique())
@@ -523,7 +506,7 @@ def main():
         log(f"Executing Dynamic Prior-Weighted MILP Allocation for Panel Size: {actual_size} (Alpha: {args.alpha})")
         try:
             # Pass args.alpha directly to solve_milp
-            selected_local = solve_milp(A, bias, weights, args, actual_size, candidate_priors, args.alpha)
+            selected_local = solve_milp(A, bias, weights, args, actual_size, candidate_priors)
             selected_global_idx = candidate_idx[selected_local]
             
             generate_outputs(
@@ -534,7 +517,7 @@ def main():
             log(f"Solver routine failed for size {actual_size}: {e}")
 
 
-if __name__ == "__main__":
+def cli():
     try:
         main()
     except KeyboardInterrupt:
@@ -548,3 +531,7 @@ if __name__ == "__main__":
             
         print("[!] Cleanup complete. Exiting.")
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    cli()

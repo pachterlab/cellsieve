@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cellsieve"
+version = "0.1.0"
+description = "Select minimal cell type marker panels from single-cell data."
+readme = "README.md"
+requires-python = ">=3.8"
+license = "BSD-2-Clause"
+license-files = ["LICENSE"]
+dependencies = [
+    "numpy",
+    "pandas",
+    "scanpy",
+    "scipy",
+    "scikit-learn",
+    "gurobipy",
+    "joblib"
+]
+
+[tool.setuptools]
+py-modules = ["cellsieve"]
+
+[project.scripts]
+cellsieve = "cellsieve:cli"
